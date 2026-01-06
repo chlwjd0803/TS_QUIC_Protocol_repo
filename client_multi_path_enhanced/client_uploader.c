@@ -126,28 +126,36 @@ static int loop_cb(
     /* 16개의 quic 허용 수치까지 도달하기 전에 초기화 작업도 포함됨*/
     static uint64_t last_probe_ts = 0;
     
+    /* [RECOVERY] 와이파이 생존 확인 및 경로 상태 강제 진단 */
     if (!wlan_alive && (now - last_probe_ts > 2000000)) {
-        
-        LOGF("[RECOVERY] Wi-Fi 경로 복구 시도 (IP/Port 자동 할당)...");
+        LOGF("==========================================================");
+        LOGF("[DIAG] Wi-Fi Down! Checking Engine Path List (Total: %d)", c->nb_paths);
 
-        /* [세그멘테이션 오류 해결의 열쇠] 
-         * 죽어버린 192.168.0.170을 강제하지 말고, 0.0.0.0(Any)을 사용합니다.
-         * 어차피 nmcli로 라우팅을 고정했으므로, 와이파이가 켜지면 
-         * OS가 알아서 192.168.0.170을 태워서 보냅니다.
-         */
+        for (int i = 0; i < (int)c->nb_paths; i++) {
+            picoquic_path_t* p = c->path[i];
+            if (!p || !p->first_tuple) continue;
+
+            /* 로컬(나의) IP 정보 추출 */
+            struct sockaddr_in* la = (struct sockaddr_in*)&p->first_tuple->local_addr;
+            char l_ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &la->sin_addr, l_ip, INET_ADDRSTRLEN);
+
+            /* 경로 상태 출력 (가장 중요한 Verified 값 포함) */
+            LOGF("  [Path %d] Local: %s:%d", i, l_ip, ntohs(la->sin_port));
+            LOGF("           Verified: %d | RTT: %lu ms", 
+                 p->first_tuple->challenge_verified, 
+                 (unsigned long)(p->smoothed_rtt / 1000));
+        }
+
+        /* 핫스팟 주소를 포함한 신규 경로 프로빙 시도 */
         struct sockaddr_in probe_addr = {0};
         probe_addr.sin_family = AF_INET;
-        probe_addr.sin_port = 0;                  // 포트 0 (자동)
-        probe_addr.sin_addr.s_addr = INADDR_ANY;  // IP 0.0.0.0 (자동)
+        probe_addr.sin_port = 0;
+        probe_addr.sin_addr.s_addr = INADDR_ANY;
 
-        picoquic_probe_new_path(
-            c,
-            (struct sockaddr*)&st->peerA,
-            (struct sockaddr*)&probe_addr,
-            now
-        );
-
+        picoquic_probe_new_path(c, (struct sockaddr*)&st->peerA, (struct sockaddr*)&probe_addr, now);
         last_probe_ts = now;
+        LOGF("==========================================================");
     }
 
 
@@ -369,6 +377,7 @@ int main(int argc, char** argv){
     lp.local_af = AF_INET;
     lp.extra_socket_required = 1;
     lp.do_not_use_gso = 1;
+    
 
     LOGF("[MAIN] entering packet loop...");
 
