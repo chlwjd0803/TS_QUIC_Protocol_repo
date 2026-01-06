@@ -16,20 +16,37 @@
  */
 static inline path_metric_t compute_metric_safe(picoquic_path_t* p) {
     path_metric_t M = {0};
-    if (!p || !p->first_tuple) { M.grade = 2; return M; }
+    
+    /* 경로가 없거나 튜플이 없으면 무조건 BAD */
+    if (!p || !p->first_tuple) { 
+        M.grade = 2; 
+        return M; 
+    }
 
-    /* [수정] Verified:0 이어도 '존재'만 하면 1등급(WARN)을 줍니다. */
-    /* 이렇게 해야 와이파이가 끊겼을 때 엔진이 셀룰러를 선택할 수 있습니다. */
+    /* * [수정 핵심 1] Verified가 풀려도(0이어도) 일단 데이터는 보내야 다시 살릴 수 있음.
+     * 따라서 Verified=0 이어도 Grade 1(WARN) 정도로 설정해서 선택 후보에 남김.
+     */
     if (!p->first_tuple->challenge_verified) {
-        M.grade = 1; 
-        M.rtt_ms = 150.0; 
+        M.grade = 1;  // 기존 2 -> 1로 완화
+        M.rtt_ms = 200.0; // 가상의 RTT 부여
         return M;
     }
 
-    /* 정상 경로 등급 판정 (와이파이 복구 감지용) */
+    /* * [수정 핵심 2] 셀룰러의 RTT 변동성을 고려하여 기준 대폭 완화
+     * - 기존: 250ms 넘으면 BAD(2)
+     * - 변경: 800ms 넘어야 BAD(2), 그 전까진 참고 씀(0 or 1)
+     */
     double rtt_ms = (p->smoothed_rtt > 0 ? p->smoothed_rtt / 1000.0 : 50.0);
     M.rtt_ms = rtt_ms;
-    M.grade = (rtt_ms > 250.0) ? 2 : 0; 
+
+    if (rtt_ms > 800.0) {
+        M.grade = 2; // 진짜 못 쓸 정도 (0.8초 지연)
+    } else if (rtt_ms > 200.0) {
+        M.grade = 1; // 좀 느리지만 쓸만함 (LTE 평균)
+    } else {
+        M.grade = 0; // 아주 좋음 (Wi-Fi 급)
+    }
+
     return M;
 }
 
@@ -44,35 +61,44 @@ static inline int fsm_pick(
     uint64_t now,
     uint64_t* last_switch_time
 ){
-    /* 체류 시간(Dwell Time) 및 마진 파라미터 */
-    const uint64_t DWELL_FAILOVER = 200000;  // 200 ms (Failover 유지)
-    const uint64_t DWELL_FAILBACK = 400000;  // 400 ms (Failback 유지)
-    const double   RTT_MARGIN_MS  = 20.0;    // 스위칭을 위한 최소 RTT 이득
-
     int lp = *last_primary;
-    uint64_t dt = now - *last_switch_time;
 
-    /* 1. 와이파이가 주 경로일 때 */
-    if (lp == wlan_id || lp == -1) {
-        /* 와이파이가 진짜 죽었을 때만 셀룰러로 전환 */
-        if (!WLAN || WLAN->grade == 2) {
-            if (USB) { 
-                *last_primary = usb_id; *last_switch_time = now;
-                return usb_id; 
-            }
+    /* ---------------------------------------------------------
+     * [수정 핵심] 와이파이(WLAN)가 없거나 죽었으면,
+     * 셀룰러(USB)가 존재하기만 하면 무조건 그쪽으로 보냄.
+     * (셀룰러 등급 따지지 않음. 안 보내는 것보단 낫기 때문)
+     * --------------------------------------------------------- */
+    int wlan_dead = (!WLAN || WLAN->grade == 2);
+    int usb_exists = (USB && usb_id >= 0);
+
+    if (wlan_dead) {
+        if (usb_exists) {
+            *last_primary = usb_id;
+            *last_switch_time = now;
+            return usb_id; 
         }
-        return wlan_id >= 0 ? wlan_id : 0;
+        // 둘 다 죽었으면 어쩔 수 없이 기존 경로 리턴 (재시도 기대)
+        return lp;
     }
 
-    /* 2. 셀룰러가 주 경로일 때 (와이파이 복구 대기) */
+    /* 이하 로직은 와이파이가 살아있을 때만 작동 */
+    
+    /* 1. 현재 와이파이 사용 중일 때 */
+    if (lp == wlan_id || lp == -1) {
+        // 와이파이가 살아있으면(grade 0,1) 계속 씀
+        return wlan_id;
+    }
+
+    /* 2. 현재 셀룰러 사용 중인데 와이파이가 돌아왔을 때 */
     if (lp == usb_id) {
-        /* 와이파이가 복구(grade 0 또는 1)되면 '즉시' 와이파이로 복귀 */
-        if (WLAN && WLAN->grade <= 1) {
-            *last_primary = wlan_id; *last_switch_time = now;
+        // 와이파이가 Grade 0(최상)으로 복귀하면 즉시 복귀
+        if (WLAN && WLAN->grade == 0) {
+            *last_primary = wlan_id;
+            *last_switch_time = now;
             return wlan_id;
         }
-        return usb_id;
     }
+
     return lp;
 }
 
