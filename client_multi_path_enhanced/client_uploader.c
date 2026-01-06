@@ -129,41 +129,81 @@ static int loop_cb(
     /* [RECOVERY] 와이파이 생존 확인 및 경로 상태 강제 진단 */
     if (!wlan_alive && (now - last_probe_ts > 2000000)) {
         LOGF("==========================================================");
-        LOGF("[DIAG] Wi-Fi Down! Checking Engine Path List (Total: %d)", c->nb_paths);
+        LOGF("[DIAG] Wi-Fi Down. Checking existing paths...");
 
-        for (int i = 0; i < (int)c->nb_paths; i++) {
-            picoquic_path_t* p = c->path[i];
-            if (!p || !p->first_tuple) continue;
-
-            /* 로컬(나의) IP 정보 추출 */
-            struct sockaddr_in* la = (struct sockaddr_in*)&p->first_tuple->local_addr;
-            char l_ip[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &la->sin_addr, l_ip, INET_ADDRSTRLEN);
-
-            /* 경로 상태 출력 (가장 중요한 Verified 값 포함) */
-            LOGF("  [Path %d] Local: %s:%d", i, l_ip, ntohs(la->sin_port));
-            LOGF("           Verified: %d | RTT: %lu ms", 
-                 p->first_tuple->challenge_verified, 
-                 (unsigned long)(p->smoothed_rtt / 1000));
+        int wlan_path_idx = -1;
+        for (int i = 0; i < c->nb_paths; i++) {
+            if (c->path[i] && c->path[i]->first_tuple) {
+                struct sockaddr_in* la = (struct sockaddr_in*)&c->path[i]->first_tuple->local_addr;
+                if (la->sin_addr.s_addr == st->ip_wlan_be) {
+                    wlan_path_idx = i; // 이미 엔진에 와이파이 경로가 존재함
+                    break;
+                }
+            }
         }
 
-        /* 핫스팟 주소를 포함한 신규 경로 프로빙 시도 */
-        struct sockaddr_in probe_addr = {0};
-        probe_addr.sin_family = AF_INET;
-        probe_addr.sin_port = 0;
-        probe_addr.sin_addr.s_addr = INADDR_ANY;
+        if (wlan_path_idx != -1) {
+            /* [중요] 경로가 이미 있다면 새로 만들지 말고 챌린지만 다시 보냄 */
+            LOGF("[DIAG] Wi-Fi path exists (ID:%d). Re-probing...", wlan_path_idx);
+            picoquic_set_path_challenge(c, wlan_path_idx, now);
+        } else {
+            /* 경로가 아예 없을 때만 새로 생성 */
+            LOGF("[DIAG] Wi-Fi path missing. Creating new probe...");
+            struct sockaddr_in wlan_probe = {0};
+            wlan_probe.sin_family = AF_INET;
+            wlan_probe.sin_port = htons(55002);
+            wlan_probe.sin_addr.s_addr = st->ip_wlan_be;
+            picoquic_probe_new_path(c, (struct sockaddr*)&st->peerA, (struct sockaddr*)&wlan_probe, now);
+        }
 
-        picoquic_probe_new_path(c, (struct sockaddr*)&st->peerA, (struct sockaddr*)&probe_addr, now);
         last_probe_ts = now;
         LOGF("==========================================================");
     }
 
+    /* [LOG] 루프 진입 시점 기록 */
+    if (cb_mode == picoquic_packet_loop_ready) {
+        LOGF("[DEBUG-LOOP] Packet loop ready. WLAN_IP=%x, USB_IP=%x", st->ip_wlan_be, st->ip_usb_be);
+    }
 
     /* 4. 보조 경로(Hotspot) 초기화 (한 번만 실행) */
+    /* [RECOVERY & PROBE 블록 강화] */
     if (st->has_local_alt && !st->didB && now - st->hs_done_ts > 500000) {
-        LOGF("[PROBE] Probing Backup Path (Hotspot)...");
-        picoquic_probe_new_path(c, (struct sockaddr*)&st->peerA, (struct sockaddr*)&st->local_alt, now);
-        st->didB = 1;
+        char alt_ip_str[INET_ADDRSTRLEN];
+        struct sockaddr_in* sa_alt = (struct sockaddr_in*)&st->local_alt;
+        inet_ntop(AF_INET, &(sa_alt->sin_addr), alt_ip_str, INET_ADDRSTRLEN);
+
+        LOGF("[PROBE-STEP1] Attempting Hotspot Probe. Target IP: %s:%d", 
+             alt_ip_str, ntohs(sa_alt->sin_port));
+        
+        int probe_ret = picoquic_probe_new_path(c, (struct sockaddr*)&st->peerA, 
+                                               (struct sockaddr*)&st->local_alt, now);
+        
+        if (probe_ret == 0) {
+            LOGF("[PROBE-STEP2] Hotspot probe packet passed to Engine. Waiting for Server Response...");
+            st->didB = 1;
+        } else {
+            LOGF("[PROBE-ERR] Engine rejected probe request. Error code: %d", probe_ret);
+        }
+    }
+
+    /* [PATH 상세 모니터링] 1초마다 모든 경로의 '쌩' 상태를 출력 */
+    static uint64_t last_diag_ts = 0;
+    if (now - last_diag_ts > 1000000) {
+        for (int i = 0; i < (int)c->nb_paths; i++) {
+            picoquic_path_t* p = c->path[i];
+            if (!p || !p->first_tuple) continue;
+            
+            struct sockaddr_in* la = (struct sockaddr_in*)&p->first_tuple->local_addr;
+            LOGF("[PATH-STATUS] ID:%d | Local:%08x | Verified:%d | RTT:%lu ms | CongestionWindow:%lu",
+                 i, la->sin_addr.s_addr, p->first_tuple->challenge_verified, 
+                 (unsigned long)(p->smoothed_rtt/1000), p->cwin);
+            
+            /* [중요] 만약 핫스팟 주소인데 Verified가 0이라면 서버 응답이 안 온 것 */
+            if (la->sin_addr.s_addr == st->ip_usb_be && !p->first_tuple->challenge_verified) {
+                LOGF("[CRITICAL] Hotspot Path exists but NOT VERIFIED by server. Check Server Multipath Config.");
+            }
+        }
+        last_diag_ts = now;
     }
     
     /* 5. Keep-alive (1초마다) */
@@ -203,27 +243,26 @@ static int loop_cb(
         /* 경로 선택 및 전송 */
         pathsel_t sel[MAX_PATHS];
         int sc = 0;
-        build_unique_verified_paths(c, sel, &sc);
+
+        /* [수정] Verified 여부와 상관없이 '존재하는 모든 경로'를 후보에 넣습니다. */
+        for (int i = 0; i < c->nb_paths; i++) {
+            if (c->path[i] && c->path[i]->first_tuple) {
+                sel[sc].idx = i;
+                sel[sc].p = c->path[i];
+                sel[sc].ip_be = ((struct sockaddr_in*)&c->path[i]->first_tuple->local_addr)->sin_addr.s_addr;
+                sc++;
+            }
+        }
 
         if (sc > 0) {
+            /* pick_primary_idx가 이제 셀룰러(grade 1)와 와이파이(grade 0)를 비교하여 선택합니다. */
             int k = pick_primary_idx(c, sel, sc, st->ip_wlan_be, st->ip_usb_be, 
-                                   &st->last_primary_idx, now, &st->last_switch_ts);
-
-            k = choose_verified_or_fallback(c, k);
+                                &st->last_primary_idx, now, &st->last_switch_ts);
             
+            /* choose_verified_or_fallback을 거치지 말고 직접 k를 사용하여 전송 */
             if (k >= 0) {
-
                 size_t hlen = varint_enc(cam_len, st->lenb);
                 send_on_path_safe(c, st, k, st->lenb, hlen, st->cap_buf, cam_len);
-                
-                /* 간단 모니터링 로그 */
-                static uint64_t last_log = 0;
-
-                if (now - last_log > ONE_SEC_US) {
-                    
-                    LOGF("[MON] Sent frame via Path[%d] (%d bytes)", k, cam_len);
-                    last_log = now;
-                }
             }
         }
     }
@@ -240,8 +279,8 @@ static int loop_cb(
 int main(int argc, char** argv){
 
     /* 0. 기본 네트워크 설정 및 인자 파싱 */
-    const char* server_ip     = "192.168.0.83";
-    const char* local_alt_ip  = "165.229.169.135";      // Hotspot (eth1 등)
+    const char* server_ip     = "165.229.169.116";
+    const char* local_alt_ip  = "172.20.10.11";      // Hotspot (eth1 등)
     const char* local_usb_ip  = "192.168.0.170";      // Wi-Fi (wlan0 등)
     int port = 4433;
 
@@ -322,15 +361,17 @@ int main(int argc, char** argv){
     st.last_switch_ts   = 0;
     pthread_mutex_init(&st.cam_mtx, NULL);
 
+    int alt_port = 51021;
+    int usb_port = 55002;
+
     /* 로컬 주소 정보 저장 (Path Probing 시 사용) */
     if (!store_local_ip(local_alt_ip, 0, &st.local_alt)) {
         st.has_local_alt = 1;
-        ((struct sockaddr_in*)&st.local_alt)->sin_port = htons(55001);
+        ((struct sockaddr_in*)&st.local_alt)->sin_port = htons(alt_port);
     }
-
     if (!store_local_ip(local_usb_ip, 0, &st.local_usb)) {
         st.has_local_usb = 1;
-        ((struct sockaddr_in*)&st.local_usb)->sin_port = htons(55002);
+        ((struct sockaddr_in*)&st.local_usb)->sin_port = htons(usb_port);
     }
 
 
@@ -360,12 +401,29 @@ int main(int argc, char** argv){
     /* 7. 메인 소켓 바인딩 (Wi-Fi NIC 강제 고정) */
     LOGF("[MAIN] binding main socket to Wi-Fi NIC...");
 
-    int sock_wlan = make_bound_socket(local_usb_ip, 55002);
+    /* 7. 메인 소켓 바인딩 부분 수정 */
+    int sock_wlan = -1;
+    int sock_alt  = -1;
 
-    int sock_alt  = make_bound_socket(local_alt_ip, 55001); // 핫스팟(랜선)용 소켓 추가
+    // Wi-Fi 소켓: IP가 유효할 때만 생성
+    if (st.has_local_usb) {
+        sock_wlan = make_bound_socket(local_usb_ip, usb_port);
+        if (sock_wlan < 0) {
+            LOGF("[WRN] Wi-Fi NIC가 없거나 바인딩 실패. 일단 계속 진행합니다.");
+        }
+    }
 
-    if (sock_wlan < 0 || sock_alt < 0) {
-        LOGF("[ERR] 소켓 바인딩 실패. IP 설정을 확인하세요.");
+    // 핫스팟 소켓: IP가 유효할 때만 생성
+    if (st.has_local_alt) {
+        sock_alt = make_bound_socket(local_alt_ip, alt_port);
+        if (sock_alt < 0) {
+            LOGF("[WRN] Hotspot NIC가 없거나 바인딩 실패.");
+        }
+    }
+
+    // 최소한 하나의 소켓은 있어야 함
+    if (sock_wlan < 0 && sock_alt < 0) {
+        LOGF("[ERR] 사용할 수 있는 네트워크 인터페이스가 하나도 없습니다.");
         return -1;
     }
 
@@ -377,7 +435,6 @@ int main(int argc, char** argv){
     lp.local_af = AF_INET;
     lp.extra_socket_required = 1;
     lp.do_not_use_gso = 1;
-    
 
     LOGF("[MAIN] entering packet loop...");
 

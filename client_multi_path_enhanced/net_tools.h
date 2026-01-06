@@ -4,6 +4,20 @@
 #include "default_header.h"
 #include "struct_type.h"
 
+/* net_tools.h 최상단에 추가 */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE  /* SO_BINDTODEVICE 같은 GNU 확장 기능을 활성화합니다. */
+#endif
+
+#include <net/if.h>  /* 인터페이스 관련 정의를 위해 필요할 수 있습니다. */
+#include <sys/socket.h>
+#include <string.h>
+
+/* 만약 위 헤더를 추가해도 빨간 줄이 안 사라진다면, 아래와 같이 직접 상수를 정의해버려도 됩니다. */
+#ifndef SO_BINDTODEVICE
+#define SO_BINDTODEVICE 25
+#endif
+
 /* ============================================================
  * [1] 파일 시스템 및 공통 상수 설정
  * ============================================================ */
@@ -98,32 +112,41 @@ static int store_local_ip(const char* ip, uint16_t port, struct sockaddr_storage
  * ============================================================ */
 
 /**
- * @brief 특정 로컬 IP와 포트에 바인딩된 UDP 소켓을 생성합니다.
- * 멀티패스 환경에서 특정 NIC(네트워크 카드)를 강제 지정할 때 사용됩니다.
+ * @brief 특정 로컬 IP와 포트에 바인딩하고, 물리적 NIC까지 강제로 지정합니다.
  */
 int make_bound_socket(const char* ip, int port)
 {
-    /* UDP 소켓 생성 */
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) {
         perror("socket");
         return -1;
     }
 
-    /* 바인딩할 주소 구조체 설정 */
+    /* 1. 하드웨어 이름 지정 (사용자 시스템 확인 값) */
+    const char* if_wlan = "wlP1p1s0"; 
+    const char* if_cellular  = "enx2a022e8f65a1";
+
+    /* 2. 목적지 IP 대역에 따른 물리적 NIC 강제 고정 */
+    if (ip != NULL) {
+        if (strncmp(ip, "192.168", 7) == 0) {
+            setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, if_wlan, strlen(if_wlan));
+        } else if (strncmp(ip, "172.20", 6) == 0) { // 핫스팟 대역 체크
+            setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, if_cellular, strlen(if_cellular));
+    }
+}
+
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
     addr.sin_port   = htons(port);
     inet_pton(AF_INET, ip, &addr.sin_addr);
 
-    /* 소켓과 로컬 주소 바인딩 */
     if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("bind");
         close(fd);
         return -1;
     }
 
-    LOGF("[SOCK] bound %s:%d fd=%d", ip, port, fd);
+    LOGF("[SOCK] bound %s:%d fd=%d (Hardware-Locked)", ip, port, fd);
     return fd;
 }
 
