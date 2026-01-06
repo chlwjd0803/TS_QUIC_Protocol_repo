@@ -137,13 +137,15 @@ static int loop_cb(picoquic_quic_t* quic, picoquic_packet_loop_cb_enum cb_mode,
 }
 
 int main(int argc, char** argv){
-    const char* server_ip = "192.168.0.83";
+    const char* server_ip = "165.229.169.116";
     const char* local_ip  = "192.168.0.170"; 
     int port = 4433;
+    int sock_port = 55002;
 
     if (argc > 1) server_ip = argv[1];
     if (argc > 2) local_ip  = argv[2];
     if (argc > 3) port      = atoi(argv[3]);
+    if (argc > 4) sock_port = atoi(argv[4]);
 
     picoquic_quic_t* q = picoquic_create(32, NULL, NULL, NULL, "hq", NULL, NULL, NULL, NULL, NULL,
                                         picoquic_current_time(), NULL, NULL, NULL, 1);
@@ -172,7 +174,7 @@ int main(int argc, char** argv){
     pthread_create(&st.cam_thread, NULL, camera_thread_main, &st);
     st.cam_thread_started = 1;
 
-    int sock = make_bound_socket(local_ip, 55002);
+    int sock = make_bound_socket(local_ip, sock_port);
 
     picoquic_packet_loop_param_t lp = {0};
     lp.local_af = AF_INET;
