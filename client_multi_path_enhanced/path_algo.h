@@ -17,34 +17,43 @@
 static inline path_metric_t compute_metric_safe(picoquic_path_t* p) {
     path_metric_t M = {0};
     
-    /* 경로가 없거나 튜플이 없으면 무조건 BAD */
+    /* 1. 객체가 아예 없으면 어쩔 수 없이 사망 */
     if (!p || !p->first_tuple) { 
         M.grade = 2; 
         return M; 
     }
 
-    /* * [수정 핵심 1] Verified가 풀려도(0이어도) 일단 데이터는 보내야 다시 살릴 수 있음.
-     * 따라서 Verified=0 이어도 Grade 1(WARN) 정도로 설정해서 선택 후보에 남김.
-     */
+    uint64_t now = picoquic_get_quic_time(p->cnx);
+
+    /* 2. [수정] Verified 체크 + 좀비 방지 로직 */
     if (!p->first_tuple->challenge_verified) {
-        M.grade = 1;  // 기존 2 -> 1로 완화
-        M.rtt_ms = 200.0; // 가상의 RTT 부여
+        
+        /* * 핫스팟이 Grade 2가 되면 갈 곳이 없어서 터짐.
+         * 따라서 아주 오랫동안(5초) 응답이 없어도, 일단은 살아있는 척(Grade 1) 해야 함.
+         * 그래야 계속 찔러서(Probe) 살려낼 수 있음.
+         */
+        if (now - p->last_packet_received_at > 5000000) { 
+            /* 너무 오래 침묵하면 Grade 2를 주는 게 정석이지만,
+             * 지금은 세그폴트 방지를 위해 Grade 1로 유지합니다. */
+            M.grade = 1; 
+        } else {
+            M.grade = 1; 
+        }
+        M.rtt_ms = 200.0;
         return M;
     }
 
-    /* * [수정 핵심 2] 셀룰러의 RTT 변동성을 고려하여 기준 대폭 완화
-     * - 기존: 250ms 넘으면 BAD(2)
-     * - 변경: 800ms 넘어야 BAD(2), 그 전까진 참고 씀(0 or 1)
-     */
+    /* 3. RTT 평가 */
     double rtt_ms = (p->smoothed_rtt > 0 ? p->smoothed_rtt / 1000.0 : 50.0);
     M.rtt_ms = rtt_ms;
 
-    if (rtt_ms > 800.0) {
-        M.grade = 2; // 진짜 못 쓸 정도 (0.8초 지연)
+    /* RTT가 3초까지 늘어져도 버팀 (핫스팟 불안정성 고려) */
+    if (rtt_ms > 3000.0) {
+        M.grade = 2; 
     } else if (rtt_ms > 200.0) {
-        M.grade = 1; // 좀 느리지만 쓸만함 (LTE 평균)
+        M.grade = 1; 
     } else {
-        M.grade = 0; // 아주 좋음 (Wi-Fi 급)
+        M.grade = 0; 
     }
 
     return M;
@@ -63,43 +72,25 @@ static inline int fsm_pick(
 ){
     int lp = *last_primary;
 
-    /* ---------------------------------------------------------
-     * [CASE 1] 현재 와이파이를 사용 중이거나, 초기 상태일 때
-     * --------------------------------------------------------- */
-    if (lp == wlan_id || lp == -1) {
-        
-        /* 와이파이가 죽었을 때만(Grade 2) 셀룰러로 전환 */
-        if (!WLAN || WLAN->grade == 2) {
-            if (USB && usb_id >= 0) {
-                *last_primary = usb_id;
-                *last_switch_time = now;
-                return usb_id; 
-            }
+    /* 1. 와이파이가 살아있으면(Grade 0 or 1) 무조건 와이파이 */
+    if (wlan_id >= 0 && WLAN && WLAN->grade < 2) {
+        if (lp != wlan_id) {
+            *last_primary = wlan_id;
+            *last_switch_time = now;
         }
-        /* 와이파이가 조금 느려도(Grade 1) 웬만하면 와이파이 유지 */
-        return wlan_id >= 0 ? wlan_id : 0;
+        return wlan_id; 
     }
 
-    /* ---------------------------------------------------------
-     * [CASE 2] 현재 셀룰러(USB)를 사용 중일 때 (복귀 로직)
-     * --------------------------------------------------------- */
-    if (lp == usb_id) {
-        
-        /* [핵심 수정] 와이파이 우선 정책 (Wi-Fi Priority) 
-         * 셀룰러 상태가 아무리 좋아도(Grade 0이어도),
-         * 와이파이가 '좋음(Grade 0)' 상태로 돌아오면 즉시 복귀한다.
-         */
-        if (WLAN && WLAN->grade == 0) {
-            *last_primary = wlan_id;     // 상태 업데이트
+    /* 2. 와이파이가 죽었으면? 핫스팟이 존재하기만 하면 무조건 선택 (등급 무시) */
+    if (usb_id >= 0) { // <-- USB && USB->grade 조건 제거함
+        if (lp != usb_id) {
+            *last_primary = usb_id;
             *last_switch_time = now;
-            return wlan_id;              // 와이파이 리턴
         }
-
-        /* 와이파이가 아직 불안정하면(Grade 1, 2) 그냥 셀룰러 유지 */
         return usb_id;
     }
 
-    /* 그 외의 경우 기존 유지 */
+    /* 3. 둘 다 없으면 기존 유지 */
     return lp;
 }
 

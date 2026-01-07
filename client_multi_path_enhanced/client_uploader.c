@@ -80,14 +80,12 @@ static int loop_cb(
 
     picoquic_state_enum cs = picoquic_get_cnx_state(c);
 
-    /* 연결이 끊어지는 중이라면 루프 종료 */
     if (cs >= picoquic_state_disconnecting && !st->closing) {
         LOGF("[LOOP] Connection lost, exiting loop to reconnect...");
         return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP; 
     }
     if (cs >= picoquic_state_disconnecting || st->closing) return 0;
 
-    /* 특정 이벤트 타이밍이 아닌 경우 스킵 */
     if (cb_mode != picoquic_packet_loop_after_receive &&
         cb_mode != picoquic_packet_loop_after_send &&
         cb_mode != picoquic_packet_loop_ready) {
@@ -103,14 +101,8 @@ static int loop_cb(
     /* 2. 0번 경로(Path 0) 생존성 보장 */
     ensure_path0_alive(c);
 
-
-    /* ------------------------------------------------------------
-     * [3. 핵심 복구 로직] 와이파이 생존 확인 및 안전한 재연결
-     * ------------------------------------------------------------ */
-    
+    /* 3. 와이파이 생존 확인 및 복구 */
     int wlan_alive = 0;
-
-    /* 현재 활성 경로 중 와이파이 IP(192.168.0.170)가 살아있는지 확인 */
     for (int i = 0; i < c->nb_paths; i++) {
         picoquic_path_t* p = c->path[i];
         if (p && p->first_tuple && p->first_tuple->challenge_verified) {
@@ -122,11 +114,7 @@ static int loop_cb(
         }
     }
 
-    /* 와이파이가 죽었고 + 마지막 시도 후 2초 지났으면 재시도 */
-    /* 16개의 quic 허용 수치까지 도달하기 전에 초기화 작업도 포함됨*/
     static uint64_t last_probe_ts = 0;
-    
-    /* [RECOVERY] 와이파이 생존 확인 및 경로 상태 강제 진단 */
     if (!wlan_alive && (now - last_probe_ts > 2000000)) {
         LOGF("==========================================================");
         LOGF("[DIAG] Wi-Fi Down. Checking existing paths...");
@@ -136,18 +124,16 @@ static int loop_cb(
             if (c->path[i] && c->path[i]->first_tuple) {
                 struct sockaddr_in* la = (struct sockaddr_in*)&c->path[i]->first_tuple->local_addr;
                 if (la->sin_addr.s_addr == st->ip_wlan_be) {
-                    wlan_path_idx = i; // 이미 엔진에 와이파이 경로가 존재함
+                    wlan_path_idx = i;
                     break;
                 }
             }
         }
 
         if (wlan_path_idx != -1) {
-            /* [중요] 경로가 이미 있다면 새로 만들지 말고 챌린지만 다시 보냄 */
             LOGF("[DIAG] Wi-Fi path exists (ID:%d). Re-probing...", wlan_path_idx);
             picoquic_set_path_challenge(c, wlan_path_idx, now);
         } else {
-            /* 경로가 아예 없을 때만 새로 생성 */
             LOGF("[DIAG] Wi-Fi path missing. Creating new probe...");
             struct sockaddr_in wlan_probe = {0};
             wlan_probe.sin_family = AF_INET;
@@ -155,58 +141,66 @@ static int loop_cb(
             wlan_probe.sin_addr.s_addr = st->ip_wlan_be;
             picoquic_probe_new_path(c, (struct sockaddr*)&st->peerA, (struct sockaddr*)&wlan_probe, now);
         }
-
         last_probe_ts = now;
         LOGF("==========================================================");
     }
 
-    /* [LOG] 루프 진입 시점 기록 */
-    if (cb_mode == picoquic_packet_loop_ready) {
-        LOGF("[DEBUG-LOOP] Packet loop ready. WLAN_IP=%x, USB_IP=%x", st->ip_wlan_be, st->ip_usb_be);
-    }
+    /* 4. 핫스팟 프로빙 검사 확대*/
+        if (st->has_local_alt) {
+            
+            int alt_path_idx = -1;
+            int is_verified = 0;
 
-    /* 4. 보조 경로(Hotspot) 초기화 (한 번만 실행) */
-    /* [RECOVERY & PROBE 블록 강화] */
-    if (st->has_local_alt && !st->didB && now - st->hs_done_ts > 500000) {
-        char alt_ip_str[INET_ADDRSTRLEN];
-        struct sockaddr_in* sa_alt = (struct sockaddr_in*)&st->local_alt;
-        inet_ntop(AF_INET, &(sa_alt->sin_addr), alt_ip_str, INET_ADDRSTRLEN);
+            /* 현재 핫스팟 경로(Path)가 존재하는지 찾기 */
+            for (int i = 0; i < c->nb_paths; i++) {
+                picoquic_path_t* p = c->path[i];
+                if (p && p->first_tuple) {
+                    struct sockaddr_in* la = (struct sockaddr_in*)&p->first_tuple->local_addr;
+                    /* 내 로컬 IP가 핫스팟 IP와 일치하는가? */
+                    if (la->sin_addr.s_addr == st->ip_usb_be) { 
+                        alt_path_idx = i;
+                        if (p->first_tuple->challenge_verified) {
+                            is_verified = 1;
+                        }
+                        break; /* 찾았으면 중단 (첫 번째 경로 사용) */
+                    }
+                }
+            }
 
-        LOGF("[PROBE-STEP1] Attempting Hotspot Probe. Target IP: %s:%d", 
-             alt_ip_str, ntohs(sa_alt->sin_port));
-        
-        int probe_ret = picoquic_probe_new_path(c, (struct sockaddr*)&st->peerA, 
+            /* 1초마다 상태 확인 */
+            static uint64_t last_alt_probe = 0;
+            if (now - last_alt_probe > 1000000) {
+                
+                /* CASE A: 아예 경로가 없다면 -> 생성 시도 (최초 1회 or 재생성) */
+                if (alt_path_idx == -1) {
+                    // 너무 자주 생성 시도하지 않도록 2초 쿨타임
+                    static uint64_t last_create_try = 0;
+                    if (now - last_create_try > 2000000) {
+                        LOGF("[PROBE] Hotspot path missing. Creating NEW path...");
+                        picoquic_probe_new_path(c, (struct sockaddr*)&st->peerA, 
                                                (struct sockaddr*)&st->local_alt, now);
-        
-        if (probe_ret == 0) {
-            LOGF("[PROBE-STEP2] Hotspot probe packet passed to Engine. Waiting for Server Response...");
-            st->didB = 1;
-        } else {
-            LOGF("[PROBE-ERR] Engine rejected probe request. Error code: %d", probe_ret);
-        }
-    }
-
-    /* [PATH 상세 모니터링] 1초마다 모든 경로의 '쌩' 상태를 출력 */
-    static uint64_t last_diag_ts = 0;
-    if (now - last_diag_ts > 1000000) {
-        for (int i = 0; i < (int)c->nb_paths; i++) {
-            picoquic_path_t* p = c->path[i];
-            if (!p || !p->first_tuple) continue;
-            
-            struct sockaddr_in* la = (struct sockaddr_in*)&p->first_tuple->local_addr;
-            LOGF("[PATH-STATUS] ID:%d | Local:%08x | Verified:%d | RTT:%lu ms | CongestionWindow:%lu",
-                 i, la->sin_addr.s_addr, p->first_tuple->challenge_verified, 
-                 (unsigned long)(p->smoothed_rtt/1000), p->cwin);
-            
-            /* [중요] 만약 핫스팟 주소인데 Verified가 0이라면 서버 응답이 안 온 것 */
-            if (la->sin_addr.s_addr == st->ip_usb_be && !p->first_tuple->challenge_verified) {
-                LOGF("[CRITICAL] Hotspot Path exists but NOT VERIFIED by server. Check Server Multipath Config.");
+                        last_create_try = now;
+                    }
+                }
+                /* CASE B: 경로는 있는데 검증이 풀림 (Verified:0) -> 챌린지 발송 */
+                else if (!is_verified) {
+                    LOGF("[PROBE] Hotspot exists(ID:%d) but UNVERIFIED. Sending Challenge...", alt_path_idx);
+                    picoquic_set_path_challenge(c, alt_path_idx, now);
+                }
+                /* CASE C: 이미 검증됨 (Verified:1) -> 
+                 * [중요] 핫스팟이 "살아있음"을 유지하기 위해 가끔 핑을 보낸다.
+                 * 1초마다 Challenge를 보내면 CWIN이 유지됨.
+                 */
+                else {
+                    // LOGF("[PROBE] Hotspot(ID:%d) is Healthy. Sending Keep-Alive Ping...", alt_path_idx);
+                    picoquic_set_path_challenge(c, alt_path_idx, now);
+                }
+                
+                last_alt_probe = now;
             }
         }
-        last_diag_ts = now;
-    }
-    
-    /* 5. Keep-alive (1초마다) */
+
+    /* 5. Keep-alive */
     if (now - st->last_keepalive_us > ONE_SEC_US) {
         static const uint8_t ka = 0;
         for (int i = 0; i < c->nb_paths; i++) {
@@ -216,53 +210,81 @@ static int loop_cb(
         st->last_keepalive_us = now;
     }
 
-    /* 6. 카메라 프레임 전송 (기존 로직 유지) */
-
+    /* 6. 카메라 전송 */
     int cam_len = 0;
     pthread_mutex_lock(&st->cam_mtx);
-
     if (st->cam_seq != st->last_sent_seq && st->cam_len > 0) {
-
         if (st->cap_cap < (size_t)st->cam_len) {
-
             uint8_t* tmp = realloc(st->cap_buf, st->cam_len);
             if (tmp) { st->cap_buf = tmp; st->cap_cap = st->cam_len; }
         }
-
         if (st->cap_buf) {
-
             memcpy(st->cap_buf, st->cam_buf, st->cam_len);
             cam_len = st->cam_len;
             st->last_sent_seq = st->cam_seq;
         }
     }
-
     pthread_mutex_unlock(&st->cam_mtx);
 
     if (cam_len > 0) {
-        /* 경로 선택 및 전송 */
         pathsel_t sel[MAX_PATHS];
         int sc = 0;
 
-        /* [수정] Verified 여부와 상관없이 '존재하는 모든 경로'를 후보에 넣습니다. */
+        /* ----------------------------------------------------------------
+         * [핵심 수정] 도플갱어 방지 (중복 IP 제거) 로직 추가
+         * ---------------------------------------------------------------- */
         for (int i = 0; i < c->nb_paths; i++) {
             if (c->path[i] && c->path[i]->first_tuple) {
-                sel[sc].idx = i;
-                sel[sc].p = c->path[i];
-                sel[sc].ip_be = ((struct sockaddr_in*)&c->path[i]->first_tuple->local_addr)->sin_addr.s_addr;
-                sc++;
+                uint32_t current_ip = ((struct sockaddr_in*)&c->path[i]->first_tuple->local_addr)->sin_addr.s_addr;
+                
+                /* 이미 리스트에 같은 IP가 있는지 검사 */
+                int is_duplicate = 0;
+                for(int j=0; j<sc; j++) {
+                    if (sel[j].ip_be == current_ip) {
+                        is_duplicate = 1;
+                        break;
+                    }
+                }
+
+                /* 중복이 아닐 때만 후보에 추가 */
+                if (!is_duplicate) {
+                    sel[sc].idx = i;
+                    sel[sc].p = c->path[i];
+                    sel[sc].ip_be = current_ip;
+                    sc++;
+                }
             }
         }
 
         if (sc > 0) {
-            /* pick_primary_idx가 이제 셀룰러(grade 1)와 와이파이(grade 0)를 비교하여 선택합니다. */
             int k = pick_primary_idx(c, sel, sc, st->ip_wlan_be, st->ip_usb_be, 
                                 &st->last_primary_idx, now, &st->last_switch_ts);
             
-            /* choose_verified_or_fallback을 거치지 말고 직접 k를 사용하여 전송 */
-            if (k >= 0) {
+            /* ================================================================
+             * [CRITICAL FIX] 세그멘테이션 오류 방지 (Null Pointer Check)
+             * k가 유효한 범위인지, path 객체가 존재하는지, tuple이 있는지 3중 체크
+             * ================================================================ */
+            if (k >= 0 && k < c->nb_paths && c->path[k] && c->path[k]->first_tuple) {
+                
+                picoquic_path_t* sel_p = c->path[k];
+
+                /* 1. 검증 안 된 경로면 챌린지 발송 (심폐소생술) */
+                if (!sel_p->first_tuple->challenge_verified) {
+                     picoquic_set_path_challenge(c, k, now);
+                }
+
+                /* 2. 전송 */
                 size_t hlen = varint_enc(cam_len, st->lenb);
-                send_on_path_safe(c, st, k, st->lenb, hlen, st->cap_buf, cam_len);
+                int ret = send_on_path_safe(c, st, k, st->lenb, hlen, st->cap_buf, cam_len);
+                
+                if (ret != 0) {
+                    // 전송 실패 시 로그 (디버깅용)
+                    // LOGF("[WRN] Send failed on path %d (ret=%d)", k, ret);
+                }
+
+            } else {
+                /* 유효하지 않은 경로가 선택됨 -> 전송 포기하고 다음 턴을 기약 */
+                LOGF("[ERR] Picked path ID:%d is INVALID (NULL). Skipping frame.", k);
             }
         }
     }
