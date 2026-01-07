@@ -64,41 +64,42 @@ static inline int fsm_pick(
     int lp = *last_primary;
 
     /* ---------------------------------------------------------
-     * [수정 핵심] 와이파이(WLAN)가 없거나 죽었으면,
-     * 셀룰러(USB)가 존재하기만 하면 무조건 그쪽으로 보냄.
-     * (셀룰러 등급 따지지 않음. 안 보내는 것보단 낫기 때문)
+     * [CASE 1] 현재 와이파이를 사용 중이거나, 초기 상태일 때
      * --------------------------------------------------------- */
-    int wlan_dead = (!WLAN || WLAN->grade == 2);
-    int usb_exists = (USB && usb_id >= 0);
-
-    if (wlan_dead) {
-        if (usb_exists) {
-            *last_primary = usb_id;
-            *last_switch_time = now;
-            return usb_id; 
-        }
-        // 둘 다 죽었으면 어쩔 수 없이 기존 경로 리턴 (재시도 기대)
-        return lp;
-    }
-
-    /* 이하 로직은 와이파이가 살아있을 때만 작동 */
-    
-    /* 1. 현재 와이파이 사용 중일 때 */
     if (lp == wlan_id || lp == -1) {
-        // 와이파이가 살아있으면(grade 0,1) 계속 씀
-        return wlan_id;
-    }
-
-    /* 2. 현재 셀룰러 사용 중인데 와이파이가 돌아왔을 때 */
-    if (lp == usb_id) {
-        // 와이파이가 Grade 0(최상)으로 복귀하면 즉시 복귀
-        if (WLAN && WLAN->grade == 0) {
-            *last_primary = wlan_id;
-            *last_switch_time = now;
-            return wlan_id;
+        
+        /* 와이파이가 죽었을 때만(Grade 2) 셀룰러로 전환 */
+        if (!WLAN || WLAN->grade == 2) {
+            if (USB && usb_id >= 0) {
+                *last_primary = usb_id;
+                *last_switch_time = now;
+                return usb_id; 
+            }
         }
+        /* 와이파이가 조금 느려도(Grade 1) 웬만하면 와이파이 유지 */
+        return wlan_id >= 0 ? wlan_id : 0;
     }
 
+    /* ---------------------------------------------------------
+     * [CASE 2] 현재 셀룰러(USB)를 사용 중일 때 (복귀 로직)
+     * --------------------------------------------------------- */
+    if (lp == usb_id) {
+        
+        /* [핵심 수정] 와이파이 우선 정책 (Wi-Fi Priority) 
+         * 셀룰러 상태가 아무리 좋아도(Grade 0이어도),
+         * 와이파이가 '좋음(Grade 0)' 상태로 돌아오면 즉시 복귀한다.
+         */
+        if (WLAN && WLAN->grade == 0) {
+            *last_primary = wlan_id;     // 상태 업데이트
+            *last_switch_time = now;
+            return wlan_id;              // 와이파이 리턴
+        }
+
+        /* 와이파이가 아직 불안정하면(Grade 1, 2) 그냥 셀룰러 유지 */
+        return usb_id;
+    }
+
+    /* 그 외의 경우 기존 유지 */
     return lp;
 }
 
