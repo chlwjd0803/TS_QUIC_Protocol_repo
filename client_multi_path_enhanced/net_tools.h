@@ -124,13 +124,13 @@ int make_bound_socket(const char* ip, int port)
 
     /* 1. 하드웨어 이름 지정 (사용자 시스템 확인 값) */
     const char* if_wlan = "wlP1p1s0"; 
-    const char* if_cellular  = "enx2a022e8f65a1";
+    const char* if_cellular  = "eno1";
 
     /* 2. 목적지 IP 대역에 따른 물리적 NIC 강제 고정 */
     if (ip != NULL) {
         if (strncmp(ip, "192.168", 7) == 0) {
             setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, if_wlan, strlen(if_wlan));
-        } else if (strncmp(ip, "172.20", 6) == 0) { // 핫스팟 대역 체크
+        } else { // 핫스팟 대역 체크
             setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, if_cellular, strlen(if_cellular));
     }
 }

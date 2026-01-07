@@ -280,7 +280,7 @@ int main(int argc, char** argv){
 
     /* 0. 기본 네트워크 설정 및 인자 파싱 */
     const char* server_ip     = "165.229.169.116";
-    const char* local_alt_ip  = "172.20.10.11";      // Hotspot (eth1 등)
+    const char* local_alt_ip  = "192.168.0.180";      // Hotspot (eth1 등)
     const char* local_usb_ip  = "192.168.0.170";      // Wi-Fi (wlan0 등)
     int port = 4433;
 
