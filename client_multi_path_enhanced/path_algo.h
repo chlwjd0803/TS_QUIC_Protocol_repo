@@ -25,35 +25,39 @@ static inline path_metric_t compute_metric_safe(picoquic_path_t* p) {
 
     uint64_t now = picoquic_get_quic_time(p->cnx);
 
-    /* 2. [수정] Verified 체크 + 좀비 방지 로직 */
+    /* 2. [복구됨] Verified 체크 + 좀비 방지 로직 
+     * - 와이파이를 꺼도 즉시 Grade 2로 죽이지 않습니다.
+     * - 5초(5,000,000us) 동안은 Grade 1(WARN) 상태로 유지하며 FSM이 자연스럽게 넘어가도록 합니다.
+     * - 이렇게 해야 "2 -> 1 -> 2"로 널뛰기하는 현상이 사라집니다.
+     */
     if (!p->first_tuple->challenge_verified) {
         
-        /* * 핫스팟이 Grade 2가 되면 갈 곳이 없어서 터짐.
-         * 따라서 아주 오랫동안(5초) 응답이 없어도, 일단은 살아있는 척(Grade 1) 해야 함.
-         * 그래야 계속 찔러서(Probe) 살려낼 수 있음.
-         */
-        if (now - p->last_packet_received_at > 5000000) { 
-            /* 너무 오래 침묵하면 Grade 2를 주는 게 정석이지만,
-             * 지금은 세그폴트 방지를 위해 Grade 1로 유지합니다. */
-            M.grade = 1; 
+        uint64_t silence_duration = now - p->last_packet_received_at;
+
+        /* 2초 이상 데이터 수신이 없고 검증도 안 된 상태라면 확실하게 사망 판정(Grade 2) */
+        if (silence_duration > 2000000) { 
+            M.grade = 2;   /* <--- 핵심 수정: Grade 1 -> Grade 2로 변경 */
+            M.rtt_ms = 10000.0; /* RTT도 매우 크게 설정 */
         } else {
+            /* 2초 이내의 일시적 검증 실패는 1등급 유지 (재시도 기회 부여) */
             M.grade = 1; 
+            M.rtt_ms = 200.0;
         }
-        M.rtt_ms = 200.0;
+        
         return M;
     }
 
-    /* 3. RTT 평가 */
+    /* 3. 정상 경로 RTT 평가 */
     double rtt_ms = (p->smoothed_rtt > 0 ? p->smoothed_rtt / 1000.0 : 50.0);
     M.rtt_ms = rtt_ms;
 
-    /* RTT가 3초까지 늘어져도 버팀 (핫스팟 불안정성 고려) */
+    /* RTT 기준 등급 판정 */
     if (rtt_ms > 3000.0) {
-        M.grade = 2; 
+        M.grade = 2;       // 3초 이상 지연되면 BAD
     } else if (rtt_ms > 200.0) {
-        M.grade = 1; 
+        M.grade = 1;       // 200ms 이상이면 WARN
     } else {
-        M.grade = 0; 
+        M.grade = 0;       // 그 외엔 GOOD
     }
 
     return M;
